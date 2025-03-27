@@ -16,21 +16,27 @@
 typedef struct {
     unsigned short page_table[PAGE_TABLE_SIZE];
     int array_size;
-    int search_indices[MAX_SEARCHES];  // Changed to static array
+    int search_indices[MAX_SEARCHES];
     int num_searches;
     int current_search;
     int frames_allocated;
     int is_active;
 } Process;
 
+// Queue structure for swap management
+typedef struct {
+    int items[MAX_PROCESSES];
+    int front;
+    int rear;
+} SwapQueue;
+
 // System state structure
 typedef struct {
     int free_frames[TOTAL_FRAMES];
     int num_free_frames;
-    Process processes[MAX_PROCESSES];  // Changed to static array
+    Process processes[MAX_PROCESSES];
     int num_processes;
-    int swap_queue[MAX_PROCESSES];
-    int swap_queue_size;
+    SwapQueue swap_queue;
     int page_accesses;
     int page_faults;
     int num_swaps;
@@ -38,8 +44,57 @@ typedef struct {
 } SystemState;
 
 // Function prototypes
+void initQueue(SwapQueue *q);
+int queueIsEmpty(SwapQueue *q);
+void enqueue(SwapQueue *q, int process_id);
+int dequeue(SwapQueue *q);
 int get_active_process_count(SystemState *system);
+void swap_out_process(SystemState *system, int process_id);
+void swap_in_process(SystemState *system, int process_id);
+int handle_page_fault(SystemState *system, int process_id, int page_num);
+void simulate_binary_search(SystemState *system, int process_id);
+void print_statistics(SystemState *system);
 
+// Queue operations implementation
+void initQueue(SwapQueue *q) {
+    q->front = q->rear = -1;
+}
+
+int queueIsEmpty(SwapQueue *q) {
+    return q->front == -1;
+}
+
+void enqueue(SwapQueue *q, int process_id) {
+    if (q->front == -1) {
+        q->front = q->rear = 0;
+    } else {
+        q->rear = (q->rear + 1) % MAX_PROCESSES;
+    }
+    q->items[q->rear] = process_id;
+}
+
+int dequeue(SwapQueue *q) {
+    if (queueIsEmpty(q)) return -1;
+    
+    int item = q->items[q->front];
+    if (q->front == q->rear) {
+        q->front = q->rear = -1;
+    } else {
+        q->front = (q->front + 1) % MAX_PROCESSES;
+    }
+    return item;
+}
+
+// Helper function implementation
+int get_active_process_count(SystemState *system) {
+    int count = 0;
+    for (int i = 0; i < system->num_processes; i++) {
+        if (system->processes[i].is_active) count++;
+    }
+    return count;
+}
+
+// Main system functions
 void initialize_system(SystemState *system, const char *input_file) {
     FILE *fp = fopen(input_file, "r");
     if (!fp) {
@@ -49,6 +104,7 @@ void initialize_system(SystemState *system, const char *input_file) {
 
     // Initialize system state
     memset(system, 0, sizeof(SystemState));
+    initQueue(&system->swap_queue);
     
     // Initialize free frames
     system->num_free_frames = USER_FRAMES;
@@ -113,7 +169,9 @@ void initialize_system(SystemState *system, const char *input_file) {
 
 void swap_out_process(SystemState *system, int process_id) {
     Process *p = &system->processes[process_id];
-    system->num_swaps++;
+    
+    // Only swap out if process is active
+    if (!p->is_active) return;
     
     for (int i = 0; i < PAGE_TABLE_SIZE; i++) {
         if (p->page_table[i] & VALID_BIT_MASK) {
@@ -124,29 +182,16 @@ void swap_out_process(SystemState *system, int process_id) {
     
     p->frames_allocated = 0;
     p->is_active = 0;
-    system->swap_queue[system->swap_queue_size++] = process_id;
+    enqueue(&system->swap_queue, process_id);
+    system->num_swaps++;
     
     int active_count = get_active_process_count(system);
     if (active_count < system->min_active_processes) {
         system->min_active_processes = active_count;
     }
     
-    printf("+++ Swapping out process %d [%d active processes]\n", 
+    printf("+++ Swapping out process %3d [%3d active processes]\n", 
            process_id, active_count);
-}
-
-void swap_in_process(SystemState *system, int process_id) {
-    Process *p = &system->processes[process_id];
-    
-    // Allocate essential frames
-    for (int i = 0; i < ESSENTIAL_PAGES && system->num_free_frames > 0; i++) {
-        p->page_table[i] = system->free_frames[--system->num_free_frames] | VALID_BIT_MASK;
-        p->frames_allocated++;
-    }
-    
-    p->is_active = 1;
-    printf("+++ Swapping in process %3d [%3d active processes]\n", 
-           process_id, get_active_process_count(system));
 }
 
 int handle_page_fault(SystemState *system, int process_id, int page_num) {
@@ -162,8 +207,29 @@ int handle_page_fault(SystemState *system, int process_id, int page_num) {
     return 0;
 }
 
+
+void swap_in_process(SystemState *system, int process_id) {
+    Process *p = &system->processes[process_id];
+    
+    // Don't swap in if already active
+    if (p->is_active) return;
+    
+    for (int i = 0; i < ESSENTIAL_PAGES && system->num_free_frames > 0; i++) {
+        p->page_table[i] = system->free_frames[--system->num_free_frames] | VALID_BIT_MASK;
+        p->frames_allocated++;
+    }
+    
+    p->is_active = 1;
+    system->num_swaps++;
+    
+    printf("+++ Swapping in process %3d [%3d active processes]\n", 
+           process_id, system->min_active_processes);
+}
+
 void simulate_binary_search(SystemState *system, int process_id) {
     Process *p = &system->processes[process_id];
+    if (!p->is_active || p->current_search >= p->num_searches) return;
+    
     int search_key = p->search_indices[p->current_search];
     
 #ifdef VERBOSE
@@ -195,6 +261,7 @@ void simulate_binary_search(SystemState *system, int process_id) {
     p->current_search++;
     
     if (p->current_search >= p->num_searches) {
+        // Process finished all searches
         for (int i = 0; i < PAGE_TABLE_SIZE; i++) {
             if (p->page_table[i] & VALID_BIT_MASK) {
                 system->free_frames[system->num_free_frames++] = p->page_table[i] & ~VALID_BIT_MASK;
@@ -203,18 +270,14 @@ void simulate_binary_search(SystemState *system, int process_id) {
         }
         p->frames_allocated = 0;
         
-        if (system->swap_queue_size > 0) {
-            swap_in_process(system, system->swap_queue[--system->swap_queue_size]);
+        // Try to swap in processes from queue
+        while (!queueIsEmpty(&system->swap_queue) && system->num_free_frames >= ESSENTIAL_PAGES) {
+            int next_process = dequeue(&system->swap_queue);
+            if (next_process != -1 && !system->processes[next_process].is_active) {
+                swap_in_process(system, next_process);
+            }
         }
     }
-}
-
-int get_active_process_count(SystemState *system) {
-    int count = 0;
-    for (int i = 0; i < system->num_processes; i++) {
-        if (system->processes[i].is_active) count++;
-    }
-    return count;
 }
 
 void print_statistics(SystemState *system) {
@@ -225,14 +288,9 @@ void print_statistics(SystemState *system) {
     printf("\tDegree of multiprogramming     = %7d\n", system->min_active_processes);
 }
 
-// Modify the main function to handle swap-ins in correct order
 int main() {
     SystemState system;
     initialize_system(&system, "search.txt");
-    
-    // Create a queue to store swapped out processes in order
-    int swap_queue[MAX_PROCESSES];
-    int swap_queue_size = 0;
     
     int active_process = 0;
     while (1) {
@@ -247,48 +305,7 @@ int main() {
         
         if (all_done) break;
         
-        int original_active = active_process;
-        do {
-            if (system.processes[active_process].is_active && 
-                system.processes[active_process].current_search < system.processes[active_process].num_searches) {
-                break;
-            }
-            active_process = (active_process + 1) % system.num_processes;
-        } while (active_process != original_active);
-        
-        // When a process finishes
-        if (system.processes[active_process].current_search >= system.processes[active_process].num_searches) {
-            // Free its frames
-            for (int i = 0; i < PAGE_TABLE_SIZE; i++) {
-                if (system.processes[active_process].page_table[i] & VALID_BIT_MASK) {
-                    system.free_frames[system.num_free_frames++] = 
-                        system.processes[active_process].page_table[i] & ~VALID_BIT_MASK;
-                    system.processes[active_process].page_table[i] = 0;
-                }
-            }
-            system.processes[active_process].frames_allocated = 0;
-            
-            // Try to swap in processes in the order they were swapped out
-            while (swap_queue_size > 0 && system.num_free_frames >= ESSENTIAL_PAGES) {
-                int next_process = swap_queue[0];
-                // Shift queue
-                for (int i = 0; i < swap_queue_size - 1; i++) {
-                    swap_queue[i] = swap_queue[i + 1];
-                }
-                swap_queue_size--;
-                swap_in_process(&system, next_process);
-            }
-        }
-        
-        if (system.processes[active_process].is_active) {
-            simulate_binary_search(&system, active_process);
-            
-            // If process was swapped out during simulation, add to queue
-            if (!system.processes[active_process].is_active) {
-                swap_queue[swap_queue_size++] = active_process;
-            }
-        }
-        
+        simulate_binary_search(&system, active_process);
         active_process = (active_process + 1) % system.num_processes;
     }
     
